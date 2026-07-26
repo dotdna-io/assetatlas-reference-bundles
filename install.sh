@@ -81,7 +81,14 @@ main() {
 
     local tmp name url out
     tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
+    # Bake the path in (double quotes) rather than deferring expansion: `tmp` is
+    # local to main(), and the EXIT trap fires after that scope is unwound — so a
+    # single-quoted '$tmp' resolved to nothing, tripped `set -u`, and printed
+    # "tmp: unbound variable" AFTER the real error while leaking the temp dir.
+    # Only ever visible on a failure path, i.e. when the operator is already
+    # trying to read an error message.
+    # shellcheck disable=SC2064  # expanding now is the fix, not the bug
+    trap "rm -rf -- '$tmp'" EXIT
     name="assetatlas-online-${version}.sh"
     url="${BUNDLE_BASE}/${name}"
     out="${tmp}/${name}"
