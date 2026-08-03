@@ -65,13 +65,153 @@ ASSETATLAS_BANNER_256
     return 0
 }
 
+# _have_sudo : its own function, and env-overridable, because a bats run cannot
+# take the real /usr/bin/sudo off PATH — `command -v sudo` would find it whatever
+# the stub directory contains. Same reason runtime.sh factors out
+# runtime_have_tty: bats stdin is never a terminal.
+_have_sudo() {
+    [ "${ASSETATLAS_ASSUME_NO_SUDO:-0}" = "1" ] && return 1
+    command -v sudo >/dev/null 2>&1
+}
+
+# _resolve_mode : decide system vs rootless, escalating if that is the answer.
+#
+# Sets the GLOBAL $MODE_FLAG to "--rootless" or leaves it empty. Deliberately NOT
+# an echo-and-capture function: the escalation branch execs, and an exec inside
+# `$( … )` replaces the SUBSHELL, not this process — sudo would run to
+# completion, the parent would carry on with sudo's output in a variable, and the
+# install would continue as the unprivileged user having "escalated". Call it
+# bare, never as `x=$(_resolve_mode …)`.
+#
+# ASSETATLAS_FORCE_ESCALATE=1 forces the escalation branch without a tty; it is
+# the test seam, since bats has no controlling terminal and the prompt would
+# otherwise be unreachable.
+MODE_FLAG=""
+_resolve_mode() {
+    [ "$(id -u)" -eq 0 ] && return 0
+
+    local have_sudo=0
+    _have_sudo && have_sudo=1
+
+    # An explicit choice short-circuits everything, including --unattended.
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --rootless) MODE_FLAG="--rootless"; return 0 ;;
+            --system)
+                # Without this, --system on a box with no sudo either dies on a
+                # raw `exec: sudo: not found` (127, if sudo is truly absent) or,
+                # if a real sudo binary exists but this user cannot use it,
+                # reaches _escalate and gets sudo's own "a password is required"
+                # — neither points at --rootless. have_sudo is already known
+                # from above the loop.
+                [ "$have_sudo" = "1" ] || _err "--system needs sudo, and none is available on this host. Pass --rootless instead."
+                _escalate "$@"
+                ;;
+        esac
+    done
+
+    if [ "$have_sudo" != "1" ]; then
+        printf 'Not root and sudo is unavailable — installing rootless into your home directory.\n' >&2
+        MODE_FLAG="--rootless"
+        return 0
+    fi
+
+    # Nobody is watching an unattended run, and a sudo password prompt inside a
+    # non-interactive pipe hangs with no output at all — the worst failure mode
+    # available to automation. Make the caller say which they meant.
+    for a in "$@"; do
+        [ "$a" = "--unattended" ] && _err \
+"Unattended install as a non-root user needs an explicit choice:
+  system-wide : curl -fsSL $BASE_URL | sudo bash -s -- --unattended
+  rootless    : curl -fsSL $BASE_URL | bash -s -- --unattended --rootless"
+    done
+
+    if [ "${ASSETATLAS_FORCE_ESCALATE:-0}" = "1" ]; then
+        _escalate "$@"
+    fi
+
+    if [ ! -e /dev/tty ] || ! (exec </dev/tty) 2>/dev/null; then
+        _err "No terminal to ask on. Pass --rootless, or re-run under sudo."
+    fi
+
+    local reply
+    printf '\n  You are not root. AssetAtlas can install either way:\n' >&2
+    printf '    [S] system-wide  /opt/assetatlas, system systemd units (needs sudo)\n' >&2
+    # ${HOME:-~}, not bare $HOME: this file runs under `set -u`, so a session
+    # with no HOME (env -i, a container user with no passwd entry) would abort
+    # the prompt itself with "HOME: unbound variable" — before the operator is
+    # asked anything, and with none of the clear diagnostics privilege.sh and
+    # the self-extract header print for that exact case.
+    printf '    [r] rootless     %s/.local/share/assetatlas, user systemd units,\n' "${HOME:-~}" >&2
+    printf '                     no Containers dashboard (cadvisor needs privileges)\n' >&2
+    # `|| reply=""` matters: Ctrl-D at this prompt makes `read` return 1, a bare
+    # simple command under `set -euo pipefail` (top of file) — without the
+    # fallback, errexit kills the script right here with no message at all. An
+    # empty reply falls into the `*)` branch below and escalates, same as any
+    # other non-"r" answer — system-wide stays the default.
+    read -r -p "  Which? [S/r] " reply </dev/tty || reply=""
+    case "$reply" in
+        r|R|rootless) MODE_FLAG="--rootless"; return 0 ;;
+        *)            _escalate "$@" ;;
+    esac
+}
+
+# _escalate : re-run the ONE-LINER under sudo. Does not return.
+#
+# Deliberately not `sudo bash "$downloaded_bundle"`: the bundle lands in a
+# mktemp dir owned by the invoking user, so sudo-exec'ing it has root run a file
+# that user can swap between the sha256 verification and the exec. Re-running the
+# one-liner costs a second ~4 KB transfer of THIS script and puts the whole
+# verified flow — manifest, download, checksum, handoff — on the root side.
+#
+# Deliberately NOT forwarding ASSETATLAS_BANNER_SHOWN=1 (which would silence the
+# second _banner call below and let this run print the logo only once): a
+# `VAR=value` argument on a sudo command line is only accepted when the matched
+# sudoers Cmnd_Spec is ALL (which implies SETENV) — under a restricted Cmnd_Spec
+# sudo refuses the WHOLE command with "sorry, you are not allowed to set the
+# following environment variables", and a restricted-sudoers operator is exactly
+# who escalate-before-download exists to serve. A duplicated banner is cosmetic
+# — and arguably correct, since it now marks a genuine change of privilege
+# context — while a hard failure for that operator is not an acceptable trade.
+#
+# The three ASSETATLAS_* URL overrides ARE carried across, and have to be: sudo's
+# env_reset drops them, so the re-run would fetch THIS script from the staging
+# mirror named on the command line and then resolve latest.json and the bundle
+# against the production default — a staging install that silently pulls the
+# production artifact. They are exported inside the `bash -c` body rather than
+# written as `VAR=value` arguments to sudo, for the reason in the paragraph
+# above: the latter form is refused outright under a restricted Cmnd_Spec.
+_escalate() {
+    printf 'Escalating with sudo for a system-wide install...\n' >&2
+    exec sudo bash -c \
+        'export ASSETATLAS_INSTALL_BASE_URL="$1" ASSETATLAS_MANIFEST_URL="$2" ASSETATLAS_BUNDLE_BASE="$3"
+         curl -fsSL "$1" | bash -s -- "${@:4}"' \
+        _ "$BASE_URL" "$MANIFEST_URL" "$BUNDLE_BASE" "$@"
+}
+
 main() {
     _banner
-    [ "$(id -u)" -eq 0 ] || _err "Run as root: curl -fsSL $BASE_URL | sudo bash"
     [ "$(uname -s)" = "Linux" ] || _err "The online installer supports Linux only."
     _have curl || _err "curl is required."
     _have tar  || _err "tar is required."
     { _have sha256sum || _have shasum; } || _err "sha256sum or shasum is required."
+
+    # Mode is decided before the download proper (the manifest/bundle curl calls
+    # below) — an escalating run must not transfer the bundle as one user and
+    # execute it as another. Deferred until after the four LOCAL checks above:
+    # they are cheap, network-free, and true regardless of privilege, so putting
+    # them first still satisfies "before the download" while catching a
+    # non-Linux host or a missing tool BEFORE a sudo prompt and a second full
+    # transfer. Missing curl specifically matters here — _have curl is what
+    # stands between a curl-less host and _escalate's re-run of
+    # `curl -fsSL "$1" | bash -s -- …`, which would otherwise feed `bash -s` an
+    # empty stdin, exit 0, and let the whole bootstrap report success having
+    # installed nothing: silent success is the worst failure mode this repo has.
+    # Called BARE — see the subshell note on _resolve_mode; a command
+    # substitution here would swallow the exec and silently continue
+    # unprivileged.
+    _resolve_mode "$@"
 
     local manifest version expected
     manifest=$(curl -fsSL --max-time 15 "$MANIFEST_URL") || _err "Could not fetch $MANIFEST_URL"
@@ -110,17 +250,19 @@ main() {
     # child inherits it identically, so cleanup (including on Ctrl-C, which hits
     # the whole process group) costs nothing.
     if [ -e /dev/tty ] && (exec </dev/tty) 2>/dev/null; then
-        bash "$out" "$@" </dev/tty
+        bash "$out" "$@" $MODE_FLAG </dev/tty
         exit $?
     fi
     local a
     for a in "$@"; do
         if [ "$a" = "--unattended" ]; then
-            bash "$out" "$@"
+            bash "$out" "$@" $MODE_FLAG
             exit $?
         fi
     done
-    _err "No terminal for interactive prompts. Re-run attached to a terminal, or pass --unattended: curl -fsSL $BASE_URL | sudo bash -s -- --unattended"
+    _err "No terminal for interactive prompts. Re-run attached to a terminal, or pass --unattended:
+  system-wide : curl -fsSL $BASE_URL | sudo bash -s -- --unattended
+  rootless    : curl -fsSL $BASE_URL | bash -s -- --unattended --rootless"
 }
 
 main "$@"
