@@ -74,87 +74,41 @@ _have_sudo() {
     command -v sudo >/dev/null 2>&1
 }
 
-# _resolve_mode : decide system vs rootless, escalating if that is the answer.
+# _resolve_mode : system-wide is the only install mode. A non-root run either
+# escalates through sudo or stops with a clear message — there is no rootless
+# fallback and no interactive system-vs-rootless prompt.
 #
-# Sets the GLOBAL $MODE_FLAG to "--rootless" or leaves it empty. Deliberately NOT
-# an echo-and-capture function: the escalation branch execs, and an exec inside
-# `$( … )` replaces the SUBSHELL, not this process — sudo would run to
-# completion, the parent would carry on with sudo's output in a variable, and the
-# install would continue as the unprivileged user having "escalated". Call it
-# bare, never as `x=$(_resolve_mode …)`.
-#
-# ASSETATLAS_FORCE_ESCALATE=1 forces the escalation branch without a tty; it is
-# the test seam, since bats has no controlling terminal and the prompt would
-# otherwise be unreachable.
-MODE_FLAG=""
+# Returns only for an already-root run. Deliberately NOT an echo-and-capture
+# function: the escalation branch execs, and an exec inside `$( … )` replaces
+# the SUBSHELL, not this process — sudo would run to completion, the parent
+# would carry on with sudo's output in a variable, and the install would
+# continue as the unprivileged user having "escalated". Call it bare, never as
+# `x=$(_resolve_mode …)`.
 _resolve_mode() {
-    [ "$(id -u)" -eq 0 ] && return 0
-
-    local have_sudo=0
-    _have_sudo && have_sudo=1
-
-    # An explicit choice short-circuits everything, including --unattended.
+    # The rootless install mode shipped in v2026.32.1 and was removed again.
+    # Refuse the flag everywhere — root or not, before anything else — rather
+    # than silently installing system-wide under a flag that promises something
+    # else.
     local a
     for a in "$@"; do
-        case "$a" in
-            --rootless) MODE_FLAG="--rootless"; return 0 ;;
-            --system)
-                # Without this, --system on a box with no sudo either dies on a
-                # raw `exec: sudo: not found` (127, if sudo is truly absent) or,
-                # if a real sudo binary exists but this user cannot use it,
-                # reaches _escalate and gets sudo's own "a password is required"
-                # — neither points at --rootless. have_sudo is already known
-                # from above the loop.
-                [ "$have_sudo" = "1" ] || _err "--system needs sudo, and none is available on this host. Pass --rootless instead."
-                _escalate "$@"
-                ;;
-        esac
+        [ "$a" = "--rootless" ] && _err \
+"The rootless install mode was removed. AssetAtlas now installs system-wide only.
+  Re-run as root or under sudo, without --rootless:
+  curl -fsSL $BASE_URL | sudo bash"
     done
 
-    if [ "$have_sudo" != "1" ]; then
-        printf 'Not root and sudo is unavailable — installing rootless into your home directory.\n' >&2
-        MODE_FLAG="--rootless"
-        return 0
-    fi
+    [ "$(id -u)" -eq 0 ] && return 0
 
-    # Nobody is watching an unattended run, and a sudo password prompt inside a
-    # non-interactive pipe hangs with no output at all — the worst failure mode
-    # available to automation. Make the caller say which they meant.
-    for a in "$@"; do
-        [ "$a" = "--unattended" ] && _err \
-"Unattended install as a non-root user needs an explicit choice:
-  system-wide : curl -fsSL $BASE_URL | sudo bash -s -- --unattended
-  rootless    : curl -fsSL $BASE_URL | bash -s -- --unattended --rootless"
-    done
+    # No usable sudo and no other route to a system-wide install: stop here,
+    # naming the remedy, instead of falling back to anything unprivileged.
+    _have_sudo || _err \
+"AssetAtlas installs system-wide only, and this run is neither root nor able to use sudo.
+  Re-run as root or under sudo:
+  curl -fsSL $BASE_URL | sudo bash"
 
-    if [ "${ASSETATLAS_FORCE_ESCALATE:-0}" = "1" ]; then
-        _escalate "$@"
-    fi
-
-    if [ ! -e /dev/tty ] || ! (exec </dev/tty) 2>/dev/null; then
-        _err "No terminal to ask on. Pass --rootless, or re-run under sudo."
-    fi
-
-    local reply
-    printf '\n  You are not root. AssetAtlas can install either way:\n' >&2
-    printf '    [S] system-wide  /opt/assetatlas, system systemd units (needs sudo)\n' >&2
-    # ${HOME:-~}, not bare $HOME: this file runs under `set -u`, so a session
-    # with no HOME (env -i, a container user with no passwd entry) would abort
-    # the prompt itself with "HOME: unbound variable" — before the operator is
-    # asked anything, and with none of the clear diagnostics privilege.sh and
-    # the self-extract header print for that exact case.
-    printf '    [r] rootless     %s/.local/share/assetatlas, user systemd units,\n' "${HOME:-~}" >&2
-    printf '                     no Containers dashboard (cadvisor needs privileges)\n' >&2
-    # `|| reply=""` matters: Ctrl-D at this prompt makes `read` return 1, a bare
-    # simple command under `set -euo pipefail` (top of file) — without the
-    # fallback, errexit kills the script right here with no message at all. An
-    # empty reply falls into the `*)` branch below and escalates, same as any
-    # other non-"r" answer — system-wide stays the default.
-    read -r -p "  Which? [S/r] " reply </dev/tty || reply=""
-    case "$reply" in
-        r|R|rootless) MODE_FLAG="--rootless"; return 0 ;;
-        *)            _escalate "$@" ;;
-    esac
+    # Non-root with sudo: escalate automatically. --unattended needs no explicit
+    # mode flag — there is only one mode left to choose.
+    _escalate "$@"
 }
 
 # _escalate : re-run the ONE-LINER under sudo. Does not return.
@@ -250,19 +204,20 @@ main() {
     # child inherits it identically, so cleanup (including on Ctrl-C, which hits
     # the whole process group) costs nothing.
     if [ -e /dev/tty ] && (exec </dev/tty) 2>/dev/null; then
-        bash "$out" "$@" $MODE_FLAG </dev/tty
+        bash "$out" "$@" </dev/tty
         exit $?
     fi
     local a
     for a in "$@"; do
         if [ "$a" = "--unattended" ]; then
-            bash "$out" "$@" $MODE_FLAG
+            bash "$out" "$@"
             exit $?
         fi
     done
+    # Reached only as root: _resolve_mode has already ended or escalated every
+    # non-root run by this point.
     _err "No terminal for interactive prompts. Re-run attached to a terminal, or pass --unattended:
-  system-wide : curl -fsSL $BASE_URL | sudo bash -s -- --unattended
-  rootless    : curl -fsSL $BASE_URL | bash -s -- --unattended --rootless"
+  curl -fsSL $BASE_URL | sudo bash -s -- --unattended"
 }
 
 main "$@"
